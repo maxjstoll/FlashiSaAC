@@ -2,6 +2,7 @@ from typing import Any, Mapping, TypeVar
 
 import gymnasium as gym
 import numpy as np
+import torch
 
 from flash_rl.agents.base_agent import BaseAgent
 from flash_rl.types import NDArray, Tensor
@@ -33,13 +34,15 @@ class RandomAgent(BaseAgent[Config]):
         interaction_step: int,
         prev_transition: Mapping[str, Tensor],
         training: bool,
+        as_numpy: bool = True,
     ) -> Tensor:
         num_envs = prev_transition["next_observation"].shape[0]
         actions = []
         for _ in range(num_envs):
             actions.append(self._action_space.sample())
 
-        return np.stack(actions).reshape(-1)
+        actions_np = np.stack(actions).reshape(-1)
+        return actions_np if as_numpy else torch.as_tensor(actions_np)
 
     def process_transition(
         self,
@@ -50,7 +53,7 @@ class RandomAgent(BaseAgent[Config]):
     def can_start_training(self) -> bool:
         return True
 
-    def update(self) -> dict[str, Any]:
+    def update(self, return_tensors: bool = False) -> dict[str, Any]:
         return {}
 
     def get_metrics(self) -> dict[str, Any]:

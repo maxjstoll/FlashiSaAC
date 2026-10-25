@@ -1,5 +1,5 @@
 import os
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import torch
 import torch.nn as nn
@@ -83,6 +83,13 @@ class Network:
         assert self._ema_update_fn is not None
         self._ema_update_fn()
 
+    @property
+    def module(self) -> nn.Module:
+        """
+        The wrapped nn.Module without the torch.compile wrapper (parameters and buffers are shared).
+        """
+        return cast(nn.Module, getattr(self.network, "_orig_mod", self.network))
+
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self.network(*args, **kwargs)
 
@@ -114,7 +121,7 @@ class Network:
         """
         os.makedirs(os.path.dirname(path), exist_ok=True)
         ckpt = {
-            "network_state_dict": self.network.state_dict(),
+            "network_state_dict": self.module.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict() if self.optimizer is not None else None,
             "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler is not None else None,
             "update_step": self.update_step,
@@ -133,14 +140,14 @@ class Network:
 
         if param_key:
             # Load only specific parameter key
-            state_dict = self.network.state_dict()
+            state_dict = self.module.state_dict()
             for key in state_dict.keys():
                 if param_key in key:
                     if key in ckpt["network_state_dict"]:
                         state_dict[key] = ckpt["network_state_dict"][key]
-            self.network.load_state_dict(state_dict)
+            self.module.load_state_dict(state_dict)
         else:
-            self.network.load_state_dict(ckpt["network_state_dict"])
+            self.module.load_state_dict(ckpt["network_state_dict"])
 
         if load_optimizer:
             if self.optimizer is not None and ckpt["optimizer_state_dict"] is not None:

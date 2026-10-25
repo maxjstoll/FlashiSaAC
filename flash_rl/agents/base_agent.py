@@ -29,6 +29,7 @@ class BaseAgent(Generic[Config], ABC):
         interaction_step: int,
         prev_transition: MutableMapping[str, Tensor],
         training: bool,
+        as_numpy: bool = True,
     ) -> Tensor:
         pass
 
@@ -46,7 +47,7 @@ class BaseAgent(Generic[Config], ABC):
         pass
 
     @abstractmethod
-    def update(self) -> dict[str, Any]:
+    def update(self, return_tensors: bool = False) -> dict[str, Any]:
         pass
 
     @abstractmethod

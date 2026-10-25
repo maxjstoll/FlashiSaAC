@@ -5,6 +5,7 @@ from typing import Any, MutableMapping, Optional, cast
 
 import gymnasium as gym
 import torch
+import torch.nn as nn
 import torch.optim as optim
 from torch.amp.grad_scaler import GradScaler
 
@@ -426,6 +427,7 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
         interaction_step: int,
         prev_transition: MutableMapping[str, Tensor],
         training: bool,
+        as_numpy: bool = True,
     ) -> Tensor:
         if training:
             temperature = 1.0
@@ -454,7 +456,10 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
                 zeta_cdf=self._zeta_cdf,
             )
 
-        return actions.cpu().numpy()
+        if as_numpy:
+            return actions.cpu().numpy()
+        # clone: with CUDA-graph compile modes, the output is overwritten by the next call
+        return actions.clone()
 
     def process_transition(self, transition: MutableMapping[str, Tensor]) -> None:
         # add to replay buffer
@@ -472,7 +477,7 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
     def can_start_training(self) -> bool:
         return self._replay_buffer.can_sample()
 
-    def update(self) -> dict[str, Any]:
+    def update(self, return_tensors: bool = False) -> dict[str, Any]:
         batch = cast(dict[str, torch.Tensor], self._replay_buffer.sample())
 
         for k, v in batch.items():
@@ -505,10 +510,11 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
         self._update_step += 1
 
         # Convert tensors to floats
-        update_info: dict[str, float] = {}
+        update_info: dict[str, Any] = {}
         for key, value in _update_info.items():
             if isinstance(value, torch.Tensor):
-                update_info[key] = value.item()
+                # clone: with CUDA-graph compile modes, the output is overwritten by the next call
+                update_info[key] = value.detach().reshape(()).clone() if return_tensors else value.item()
             elif not isinstance(value, dict):
                 update_info[key] = float(value)
 
@@ -561,3 +567,13 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
 
     def get_metrics(self) -> dict[str, Any]:
         return {}
+
+    @property
+    def actor_network(self) -> nn.Module:
+        """The actor as a plain nn.Module (without the torch.compile wrapper)."""
+        return self._actor.module
+
+    @property
+    def actor_observation_dim(self) -> int:
+        """Observation dimension of the actor."""
+        return self._actor_observation_dim

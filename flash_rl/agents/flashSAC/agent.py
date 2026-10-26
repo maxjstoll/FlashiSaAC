@@ -566,7 +566,15 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
         print(f"\033[32m[FlashSAC]\033[0m Successfully loaded replay buffer from {path}.")
 
     def get_metrics(self) -> dict[str, Any]:
-        return {}
+        buffer_size = len(self._replay_buffer)
+        metrics: dict[str, Any] = {
+            "buffer/size": buffer_size,
+            "buffer/fill_ratio": buffer_size / self._cfg.buffer_max_length,
+        }
+        for name, network in (("actor", self._actor), ("critic", self._critic), ("temperature", self._temperature)):
+            assert network.optimizer is not None
+            metrics[f"{name}/learning_rate"] = network.optimizer.param_groups[0]["lr"]
+        return metrics
 
     @property
     def actor_network(self) -> nn.Module:

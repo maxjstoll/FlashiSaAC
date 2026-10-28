@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 
 from flash_rl.agents.flashSAC.layer import (
+    DiscretePolicyHead,
     EnsembleCategoricalValue,
     EnsembleFlashSACBlock,
     EnsembleFlashSACEmbedder,
@@ -29,16 +30,24 @@ class FlashSACActor(nn.Module):
         self.post_norm = UnitRMSNorm(hidden_dim)
         self.predictor = NormalTanhPolicy(hidden_dim=hidden_dim, action_dim=action_dim)
 
-    def get_mean_and_std(
+    def encode(
         self,
         observations: torch.Tensor,
         training: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         x = observations
         x = self.embedder(x, training)
         for block in self.encoder:
             x = block(x, training)
         x = self.post_norm(x)
+        return x
+
+    def get_mean_and_std(
+        self,
+        observations: torch.Tensor,
+        training: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        x = self.encode(observations, training)
         mean, std = self.predictor.get_mean_and_std(x, training)
         return mean, std
 
@@ -47,12 +56,57 @@ class FlashSACActor(nn.Module):
         observations: torch.Tensor,
         training: bool,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        x = observations
-        x = self.embedder(x, training)
-        for block in self.encoder:
-            x = block(x, training)
-        x = self.post_norm(x)
+        x = self.encode(observations, training)
         actions, info = self.predictor(x, training)
+        return actions, info
+
+
+class HybridFlashSACActor(FlashSACActor):
+    """
+    FlashSAC actor with an additional discrete head on the shared encoder.
+    The discrete actions are not sampled in `forward`: the updates take the exact expectation over their support.
+    """
+
+    def __init__(
+        self,
+        num_blocks: int,
+        input_dim: int,
+        hidden_dim: int,
+        action_dim: int,
+        discrete_head: DiscretePolicyHead,
+    ):
+        super().__init__(
+            num_blocks=num_blocks,
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            action_dim=action_dim,
+        )
+        self.discrete_predictor = discrete_head
+
+    def get_distribution_params(
+        self,
+        observations: torch.Tensor,
+        training: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns the mean and std of the continuous actions (before tanh) and the discrete distribution params."""
+        x = self.encode(observations, training)
+        mean, std = self.predictor.get_mean_and_std(x, training)
+        discrete_params = self.discrete_predictor(x, training)
+        return mean, std, discrete_params
+
+    def forward(
+        self,
+        observations: torch.Tensor,
+        training: bool,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """
+        Samples the continuous actions.
+        `info` additionally holds the log probabilities (B, K) of the discrete support.
+        """
+        x = self.encode(observations, training)
+        actions, info = self.predictor(x, training)
+        discrete_params = self.discrete_predictor(x, training)
+        info["discrete_log_probs"] = self.discrete_predictor.log_probs(discrete_params)
         return actions, info
 
 

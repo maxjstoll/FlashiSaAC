@@ -78,6 +78,29 @@ def _compute_categorical_td_target(
     return target_probs
 
 
+def _optimizer_step(
+    network: Network,
+    loss: torch.Tensor,
+    use_amp: bool,
+    grad_scaler: Optional[GradScaler],
+) -> None:
+    """Gradient step and LR scheduler step of the given network."""
+    assert network.optimizer is not None
+    network.optimizer.zero_grad(set_to_none=True)
+    if use_amp:
+        assert grad_scaler is not None
+        grad_scaler.scale(loss).backward()
+        grad_scaler.step(network.optimizer)
+        grad_scaler.update()
+    else:
+        loss.backward()
+        network.optimizer.step()
+
+    # LR scheduler
+    if network.scheduler is not None:
+        network.scheduler.step()
+
+
 def update_actor(
     actor: Network,
     critic: Network,
@@ -135,20 +158,7 @@ def update_actor(
         mean_action = actions.mean()
 
     # Gradient step
-    assert actor.optimizer is not None
-    actor.optimizer.zero_grad(set_to_none=True)
-    if use_amp:
-        assert grad_scaler is not None
-        grad_scaler.scale(actor_loss).backward()
-        grad_scaler.step(actor.optimizer)
-        grad_scaler.update()
-    else:
-        actor_loss.backward()
-        actor.optimizer.step()
-
-    # LR scheduler
-    if actor.scheduler is not None:
-        actor.scheduler.step()
+    _optimizer_step(actor, actor_loss, use_amp, grad_scaler)
 
     # Weight Normalization
     # NOTE: Make sure you finish all computation before this (e.g., computing info values)
@@ -250,20 +260,7 @@ def update_critic(
         critic_loss = ce_loss.mean()
 
     # Gradient step
-    assert critic.optimizer is not None
-    critic.optimizer.zero_grad(set_to_none=True)
-    if use_amp:
-        assert grad_scaler is not None
-        grad_scaler.scale(critic_loss).backward()  # type: ignore
-        grad_scaler.step(critic.optimizer)
-        grad_scaler.update()
-    else:
-        critic_loss.backward()  # type: ignore
-        critic.optimizer.step()
-
-    # LR scheduler
-    if critic.scheduler is not None:
-        critic.scheduler.step()
+    _optimizer_step(critic, critic_loss, use_amp, grad_scaler)  # type: ignore
 
     # Weight Normalization
     critic.normalize_parameters()
@@ -291,6 +288,7 @@ def update_temperature(
     temperature: Network,
     entropy: torch.Tensor,
     target_entropy: float,
+    prefix: str = "temperature",
 ) -> dict[str, torch.Tensor]:
     """Update temperature network.
 
@@ -298,6 +296,7 @@ def update_temperature(
         temperature: Temperature network.
         entropy: Current entropy value.
         target_entropy: Target entropy value.
+        prefix: Prefix of the returned metric names.
     """
 
     temperature_value = temperature().clone()
@@ -314,6 +313,6 @@ def update_temperature(
         "value": temperature_value,
         "loss": temperature_loss,
     }
-    update_info = add_prefix_to_keys(update_info, "temperature")
+    update_info = add_prefix_to_keys(update_info, prefix)
 
     return update_info

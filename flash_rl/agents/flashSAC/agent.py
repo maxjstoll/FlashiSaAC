@@ -46,9 +46,11 @@ class FlashSACConfig:
     learning_rate_peak: float
     learning_rate_end: float
     learning_rate_warmup_rate: float
-    learning_rate_warmup_step: int
+    critic_learning_rate_warmup_step: int
+    actor_learning_rate_warmup_step: int
     learning_rate_decay_rate: float
-    learning_rate_decay_step: int
+    critic_learning_rate_decay_step: int
+    actor_learning_rate_decay_step: int
 
     actor_num_blocks: int
     actor_hidden_dim: int
@@ -68,6 +70,11 @@ class FlashSACConfig:
     temp_target_sigma: float
     temp_target_entropy: float
 
+    discrete_initial_probability: float
+    discrete_temp_initial_value: float
+    discrete_temp_target_probability: float
+    discrete_temp_target_entropy: float
+
     gamma: float
     n_step: int
 
@@ -79,35 +86,73 @@ class FlashSACConfig:
     load_reward_normalizer: bool
 
 
+def _init_temperature(
+    initial_value: float,
+    cfg: FlashSACConfig,
+    device: torch.device,
+) -> Network:
+    actor_warmup_cosine_decay_lr = warmup_cosine_decay_scheduler(
+        init_value=cfg.learning_rate_init,
+        peak_value=cfg.learning_rate_peak,
+        end_value=cfg.learning_rate_end,
+        warmup_steps=cfg.actor_learning_rate_warmup_step,
+        decay_steps=cfg.actor_learning_rate_decay_step,
+    )
+    use_fused = device.type == "cuda" and torch.cuda.is_available()
+
+    temp_net = FlashSACTemperature(initial_value).to(device)
+    temp_optimizer = optim.Adam(
+        temp_net.parameters(),
+        lr=cfg.learning_rate_peak,
+        fused=use_fused,
+    )
+    temp_scheduler = torch.optim.lr_scheduler.LambdaLR(
+        temp_optimizer,
+        lr_lambda=lambda step: actor_warmup_cosine_decay_lr(step) / cfg.learning_rate_peak,
+    )
+    temperature = Network(
+        network=temp_net,
+        optimizer=temp_optimizer,
+        scheduler=temp_scheduler,
+        compile_network=cfg.use_compile,
+        compile_mode=cfg.compile_mode,
+        use_weight_normalization=False,
+    )
+    return temperature
+
+
 def _init_flashsac_networks(
-    actor_observation_dim: int,
+    actor_net: nn.Module,
     critic_observation_dim: int,
     action_dim: int,
     cfg: FlashSACConfig,
     device: torch.device,
 ) -> tuple[Network, Network, Network, Network]:
-    # Create learning rate schedule
-    warmup_cosine_decay_lr = warmup_cosine_decay_scheduler(
+    """Initialize actor, critic, target critic and temperature, given the actor module and the critic action dim."""
+    # Create learning rate schedules
+    critic_warmup_cosine_decay_lr = warmup_cosine_decay_scheduler(
         init_value=cfg.learning_rate_init,
         peak_value=cfg.learning_rate_peak,
         end_value=cfg.learning_rate_end,
-        warmup_steps=cfg.learning_rate_warmup_step,
-        decay_steps=cfg.learning_rate_decay_step,
+        warmup_steps=cfg.critic_learning_rate_warmup_step,
+        decay_steps=cfg.critic_learning_rate_decay_step,
+    )
+    actor_warmup_cosine_decay_lr = warmup_cosine_decay_scheduler(
+        init_value=cfg.learning_rate_init,
+        peak_value=cfg.learning_rate_peak,
+        end_value=cfg.learning_rate_end,
+        warmup_steps=cfg.actor_learning_rate_warmup_step,
+        decay_steps=cfg.actor_learning_rate_decay_step,
     )
 
     # Initialize actor
-    actor_net = FlashSACActor(
-        num_blocks=cfg.actor_num_blocks,
-        input_dim=actor_observation_dim,
-        hidden_dim=cfg.actor_hidden_dim,
-        action_dim=action_dim,
-    ).to(device)
+    actor_net = actor_net.to(device)
 
     use_fused = device.type == "cuda" and torch.cuda.is_available()
     actor_optimizer = optim.Adam(actor_net.parameters(), lr=cfg.learning_rate_peak, fused=use_fused)
     actor_scheduler = torch.optim.lr_scheduler.LambdaLR(
         actor_optimizer,
-        lr_lambda=lambda step: warmup_cosine_decay_lr(step) / cfg.learning_rate_peak,
+        lr_lambda=lambda step: actor_warmup_cosine_decay_lr(step) / cfg.learning_rate_peak,
     )
     actor = Network(
         network=actor_net,
@@ -117,9 +162,6 @@ def _init_flashsac_networks(
         compile_mode=cfg.compile_mode,
         use_weight_normalization=True,
     )
-    # Manually compile `get_mean_and_std` function
-    if cfg.use_compile:
-        actor.network.get_mean_and_std = torch.compile(actor.network.get_mean_and_std, mode=cfg.compile_mode)  # type: ignore
 
     # Initialize critic
     critic_net = FlashSACDoubleCritic(
@@ -138,7 +180,7 @@ def _init_flashsac_networks(
     )
     critic_scheduler = torch.optim.lr_scheduler.LambdaLR(
         critic_optimizer,
-        lr_lambda=lambda step: warmup_cosine_decay_lr(step) / cfg.learning_rate_peak,
+        lr_lambda=lambda step: critic_warmup_cosine_decay_lr(step) / cfg.learning_rate_peak,
     )
     critic = Network(
         network=critic_net,
@@ -171,24 +213,7 @@ def _init_flashsac_networks(
     )
 
     # Initialize temperature
-    temp_net = FlashSACTemperature(cfg.temp_initial_value).to(device)
-    temp_optimizer = optim.Adam(
-        temp_net.parameters(),
-        lr=cfg.learning_rate_peak,
-        fused=use_fused,
-    )
-    temp_scheduler = torch.optim.lr_scheduler.LambdaLR(
-        temp_optimizer,
-        lr_lambda=lambda step: warmup_cosine_decay_lr(step) / cfg.learning_rate_peak,
-    )
-    temperature = Network(
-        network=temp_net,
-        optimizer=temp_optimizer,
-        scheduler=temp_scheduler,
-        compile_network=cfg.use_compile,
-        compile_mode=cfg.compile_mode,
-        use_weight_normalization=False,
-    )
+    temperature = _init_temperature(cfg.temp_initial_value, cfg, device)
 
     # normalize network parameters after initialization
     actor.normalize_parameters()
@@ -237,6 +262,27 @@ def _sample_flashsac_actions(
         observations=observations,
         training=False,
     )
+    return _sample_continuous_actions(
+        mean=mean,
+        std=std,
+        noise=noise,
+        temperature=temperature,
+        cur_count=cur_count,
+        cur_n=cur_n,
+        zeta_cdf=zeta_cdf,
+    )
+
+
+def _sample_continuous_actions(
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    noise: torch.Tensor,
+    temperature: float,
+    cur_count: torch.Tensor,
+    cur_n: torch.Tensor,
+    zeta_cdf: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sample tanh-Gaussian actions with noise repeat logic fully in torch."""
     # return deterministic actions without changing noise sampling params
     if temperature == 0.0:
         actions = torch.tanh(mean)
@@ -353,7 +399,9 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
         else:
             self._actor_observation_dim = self._critic_observation_dim
 
-        temp_target_entropy = 0.5 * self._action_dim * math.log(2 * math.pi * math.e * cfg.temp_target_sigma**2)
+        temp_target_entropy = (
+            0.5 * self._continuous_action_dim * math.log(2 * math.pi * math.e * cfg.temp_target_sigma**2)
+        )
         compile_mode = _resolve_compile_mode(cfg.compile_mode)
         cfg = replace(cfg, temp_target_entropy=temp_target_entropy, compile_mode=compile_mode)
 
@@ -374,18 +422,7 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
         self._device = torch.device(device_type)
 
         # Initialize networks
-        (
-            self._actor,
-            self._critic,
-            self._target_critic,
-            self._temperature,
-        ) = _init_flashsac_networks(
-            actor_observation_dim=self._actor_observation_dim,
-            critic_observation_dim=self._critic_observation_dim,
-            action_dim=self._action_dim,
-            cfg=self._cfg,
-            device=self._device,
-        )
+        self._init_networks()
         self._update_step = 0
 
         # Grad scaler for FP16 AMP
@@ -398,7 +435,8 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
         self._cur_noise_repeat_n = torch.tensor(1, dtype=torch.int32, device=self._device)
         self._cur_noise_repeat_count = torch.tensor(0, dtype=torch.int32, device=self._device)
         action_shape = tuple(action_space.shape) if action_space.shape is not None else ()
-        self._cached_noise = torch.randn(action_shape, device=self._device)
+        noise_shape = (*action_shape[:-1], self._continuous_action_dim)
+        self._cached_noise = torch.randn(noise_shape, device=self._device)
 
         # Reward normalizer
         self.reward_normalizer = None
@@ -422,6 +460,65 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             device_type=self._cfg.buffer_device_type,
         )
 
+    @property
+    def _continuous_action_dim(self) -> int:
+        """Number of tanh-Gaussian actions, the leading action dimensions."""
+        return self._action_dim
+
+    def _init_networks(self) -> None:
+        actor_net = FlashSACActor(
+            num_blocks=self._cfg.actor_num_blocks,
+            input_dim=self._actor_observation_dim,
+            hidden_dim=self._cfg.actor_hidden_dim,
+            action_dim=self._continuous_action_dim,
+        )
+        (
+            self._actor,
+            self._critic,
+            self._target_critic,
+            self._temperature,
+        ) = _init_flashsac_networks(
+            actor_net=actor_net,
+            critic_observation_dim=self._critic_observation_dim,
+            action_dim=self._action_dim,
+            cfg=self._cfg,
+            device=self._device,
+        )
+        # Manually compile `get_mean_and_std` function
+        if self._cfg.use_compile:
+            self._actor.network.get_mean_and_std = torch.compile(self._actor.network.get_mean_and_std, mode=self._cfg.compile_mode)  # type: ignore
+
+    def _sample_policy_actions(self, observations: torch.Tensor, temperature: float) -> torch.Tensor:
+        """Sample actions and advance the noise repeat state."""
+        (
+            self._cached_noise,
+            actions,
+            self._cur_noise_repeat_count,
+            self._cur_noise_repeat_n,
+        ) = _sample_flashsac_actions(
+            actor=self._actor,
+            noise=self._cached_noise,
+            observations=observations,
+            temperature=temperature,
+            cur_count=self._cur_noise_repeat_count,
+            cur_n=self._cur_noise_repeat_n,
+            zeta_cdf=self._zeta_cdf,
+        )
+        return actions
+
+    def _apply_update(self, batch: dict[str, torch.Tensor], do_actor_update: bool) -> dict[str, torch.Tensor]:
+        return _update_networks(
+            batch=batch,
+            actor=self._actor,
+            critic=self._critic,
+            target_critic=self._target_critic,
+            temperature=self._temperature,
+            cfg=self._cfg,
+            do_actor_update=do_actor_update,
+            device=self._device,
+            grad_scaler=self._grad_scaler,
+        )
+
     def sample_actions(
         self,
         interaction_step: int,
@@ -441,20 +538,7 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
         observations = torch.as_tensor(observations, dtype=torch.float32).to(self._device)
 
         with torch.no_grad():
-            (
-                self._cached_noise,
-                actions,
-                self._cur_noise_repeat_count,
-                self._cur_noise_repeat_n,
-            ) = _sample_flashsac_actions(
-                actor=self._actor,
-                noise=self._cached_noise,
-                observations=observations,
-                temperature=temperature,
-                cur_count=self._cur_noise_repeat_count,
-                cur_n=self._cur_noise_repeat_n,
-                zeta_cdf=self._zeta_cdf,
-            )
+            actions = self._sample_policy_actions(observations, temperature)
 
         if as_numpy:
             return actions.cpu().numpy()
@@ -496,16 +580,9 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             batch["reward"] = self.reward_normalizer.normalize_rewards(batch["reward"])
 
         # Update step
-        _update_info = _update_networks(
+        _update_info = self._apply_update(
             batch=batch,
-            actor=self._actor,
-            critic=self._critic,
-            target_critic=self._target_critic,
-            temperature=self._temperature,
-            cfg=self._cfg,
             do_actor_update=(self._update_step % self._cfg.actor_update_period == 0),
-            device=self._device,
-            grad_scaler=self._grad_scaler,
         )
         self._update_step += 1
 

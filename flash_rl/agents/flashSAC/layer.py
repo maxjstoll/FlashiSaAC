@@ -1,4 +1,5 @@
 import math
+from abc import ABC, abstractmethod
 
 import torch
 import torch.nn as nn
@@ -159,6 +160,71 @@ class NormalTanhPolicy(nn.Module):
 
         info: dict[str, torch.Tensor] = {"log_prob": log_prob}
         return tanh_action, info
+
+
+class DiscretePolicyHead(nn.Module, ABC):
+    """
+    Distribution over a finite set of K joint discrete actions.
+    Each joint action is encoded as a vector of size `action_dim`, as fed to the critic and the environment.
+    The updates take the exact expectation over `support` instead of sampling.
+    """
+
+    support: torch.Tensor  # (K, action_dim)
+
+    @property
+    def action_dim(self) -> int:
+        return self.support.shape[-1]
+
+    @property
+    def support_size(self) -> int:
+        return self.support.shape[0]
+
+    @abstractmethod
+    def forward(self, x: torch.Tensor, training: bool) -> torch.Tensor:
+        """Returns the distribution parameters (B, num_params)."""
+
+    @abstractmethod
+    def log_probs(self, params: torch.Tensor) -> torch.Tensor:
+        """Returns the log probabilities (B, K) of all joint actions in `support`."""
+
+    @abstractmethod
+    def sample(self, params: torch.Tensor) -> torch.Tensor:
+        """Returns sampled actions (B, action_dim)."""
+
+    @abstractmethod
+    def mode(self, params: torch.Tensor) -> torch.Tensor:
+        """Returns the most likely actions (B, action_dim)."""
+
+
+class BernoulliPolicyHead(DiscretePolicyHead):
+    """Independent Bernoulli distributions over `num_actions` binary actions, i.e. K = 2^num_actions."""
+
+    def __init__(self, hidden_dim: int, num_actions: int, initial_prob: float = 0.5):
+        super().__init__()
+        self.w = UnitLinear(hidden_dim, num_actions)
+        # the feature term of the unit-norm weights is O(1): the bias sets the initial probability
+        initial_logit = math.log(initial_prob / (1.0 - initial_prob))
+        self.bias = nn.Parameter(torch.full((num_actions,), initial_logit))
+
+        support = torch.cartesian_prod(*[torch.tensor([0.0, 1.0])] * num_actions).reshape(-1, num_actions)
+        self.register_buffer("support", support)
+
+    def forward(self, x: torch.Tensor, training: bool) -> torch.Tensor:
+        # Use functional linear for AMP
+        logits = F.linear(x, self.w.w.weight, self.bias)
+        return logits
+
+    def log_probs(self, params: torch.Tensor) -> torch.Tensor:
+        # (B, 1, n) per action log probabilities of the values 1 and 0, selected per support row (K, n)
+        log_p_1 = F.logsigmoid(params).unsqueeze(1)
+        log_p_0 = F.logsigmoid(-params).unsqueeze(1)
+        return torch.where(self.support.bool(), log_p_1, log_p_0).sum(-1)
+
+    def sample(self, params: torch.Tensor) -> torch.Tensor:
+        return torch.bernoulli(torch.sigmoid(params))
+
+    def mode(self, params: torch.Tensor) -> torch.Tensor:
+        return (params > 0.0).to(params.dtype)
 
 
 # -------------------------------------

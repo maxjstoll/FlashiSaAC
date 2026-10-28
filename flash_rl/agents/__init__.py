@@ -35,7 +35,13 @@ def create_agent(
         )
 
         config = FlashSACConfig(**cfg_dict)  # type: ignore
-        agent = FlashSACAgent(observation_space, action_space, env_info, config)
+        # continuous actions, unless the action space has discrete parts
+        if isinstance(action_space, gym.spaces.Box):
+            agent = FlashSACAgent(observation_space, action_space, env_info, config)
+        else:
+            from flash_rl.agents.flashSAC.hybrid_agent import HybridFlashSACAgent
+
+            agent = HybridFlashSACAgent(observation_space, action_space, env_info, config)
 
     else:
         raise NotImplementedError

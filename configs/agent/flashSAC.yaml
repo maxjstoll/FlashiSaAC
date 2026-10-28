@@ -21,11 +21,15 @@ learning_rate_init: 3e-4
 learning_rate_peak: 3e-4
 learning_rate_end: 1.5e-4
 learning_rate_warmup_rate: 1e-6
-learning_rate_warmup_step: ${eval:'int(${agent.learning_rate_warmup_rate} *
+critic_learning_rate_warmup_step: ${eval:'int(${agent.learning_rate_warmup_rate} *
   ${num_interaction_steps} * ${updates_per_interaction_step})'}
+actor_learning_rate_warmup_step: ${eval:'int(${agent.learning_rate_warmup_rate} *
+  ${num_interaction_steps} * ${updates_per_interaction_step} / ${agent.actor_update_period})'}
 learning_rate_decay_rate: 1.0
-learning_rate_decay_step: ${eval:'int(${agent.learning_rate_decay_rate} *
+critic_learning_rate_decay_step: ${eval:'int(${agent.learning_rate_decay_rate} *
   ${num_interaction_steps} * ${updates_per_interaction_step})'}
+actor_learning_rate_decay_step: ${eval:'int(${agent.learning_rate_decay_rate} *
+  ${num_interaction_steps} * ${updates_per_interaction_step} / ${agent.actor_update_period})'}
 
 actor_num_blocks: 2
 actor_hidden_dim: 128
@@ -44,6 +48,12 @@ critic_target_update_tau: 0.01
 temp_initial_value: 0.01
 temp_target_sigma: 0.15
 temp_target_entropy: null
+
+# discrete actions, only used if the action space has discrete parts (gym.spaces.MultiBinary: Bernoulli actions)
+discrete_initial_probability: 0.01        # initial probability of the value 1
+discrete_temp_initial_value: 0.01
+discrete_temp_target_probability: 0.015   # target entropy: the entropy of Bernoulli(p) per action
+discrete_temp_target_entropy: null
 
 gamma: ${gamma}
 n_step: ${n_step}

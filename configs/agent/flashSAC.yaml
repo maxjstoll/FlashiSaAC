@@ -37,6 +37,7 @@ actor_bc_alpha: 0.0
 actor_noise_zeta_mu: 2.0
 actor_noise_zeta_max: 16
 actor_update_period: 2
+actor_warmup_updates: 0  # critic-only updates after loading a checkpoint
 
 critic_num_blocks: 2
 critic_hidden_dim: 256

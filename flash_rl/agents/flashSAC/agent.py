@@ -58,6 +58,7 @@ class FlashSACConfig:
     actor_noise_zeta_mu: float
     actor_noise_zeta_max: int
     actor_update_period: int
+    actor_warmup_updates: int
 
     critic_num_blocks: int
     critic_hidden_dim: int
@@ -424,6 +425,8 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
         # Initialize networks
         self._init_networks()
         self._update_step = 0
+        # first update step of the actor and temperatures, set by load() for the critic warmup
+        self._actor_update_start = 0
 
         # Grad scaler for FP16 AMP
         self._grad_scaler = GradScaler(device=self._device.type, enabled=self._cfg.use_amp)
@@ -582,7 +585,10 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
         # Update step
         _update_info = self._apply_update(
             batch=batch,
-            do_actor_update=(self._update_step % self._cfg.actor_update_period == 0),
+            do_actor_update=(
+                self._update_step >= self._actor_update_start
+                and self._update_step % self._cfg.actor_update_period == 0
+            ),
         )
         self._update_step += 1
 
@@ -636,7 +642,13 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             assert self.reward_normalizer is not None
             self.reward_normalizer.load(os.path.join(path, "reward_normalizer.pt"))
 
+        self._actor_update_start = self._update_step + self._cfg.actor_warmup_updates
         print(f"\033[32m[FlashSAC]\033[0m Successfully loaded checkpoint from {path}.")
+        if self._cfg.actor_warmup_updates > 0:
+            print(
+                f"\033[32m[FlashSAC]\033[0m Critic warmup: {self._cfg.actor_warmup_updates} critic-only updates, the"
+                f" actor and temperatures update from update step {self._actor_update_start}."
+            )
 
     def load_replay_buffer(self, path: str) -> None:
         self._replay_buffer.load(os.path.join(path, "replay_buffer.pt"))

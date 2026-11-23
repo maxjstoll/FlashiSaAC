@@ -205,21 +205,31 @@ class TorchUniformBuffer(BaseBuffer):
     def load(self, path: str) -> None:
         """
         Load buffer contents and metadata.
+
+        Keeps the newest transitions that fit into max_length, so a smaller buffer than the saved one drops the
+        oldest transitions. They are stored in chronological order, so the next adds overwrite the oldest first.
         args:
             path (str): The full file path (e.g. "checkpoints/replay_buffer.pt").
         """
         dataset = torch.load(path, map_location=self._device)
         n = dataset["num_in_buffer"]
+        keep = min(n, self._max_length)
 
-        self._observations[:n] = dataset["observation"]
-        self._next_observations[:n] = dataset["next_observation"]
-        self._actions[:n] = dataset["action"]
-        self._rewards[:n] = dataset["reward"]
-        self._terminateds[:n] = dataset["terminated"]
-        self._truncateds[:n] = dataset["truncated"]
+        # the saved storage is a ring whose oldest transition is at current_idx once full (else current_idx == n):
+        # the newest `keep` transitions are at most two contiguous segments of it
+        start = (dataset["current_idx"] + n - keep) % n if n > 0 else 0
+        first = min(keep, n - start)
+        segments = [(slice(0, first), slice(start, start + first)), (slice(first, keep), slice(0, keep - first))]
+        for dst, src in segments:
+            self._observations[dst] = dataset["observation"][src]
+            self._next_observations[dst] = dataset["next_observation"][src]
+            self._actions[dst] = dataset["action"][src]
+            self._rewards[dst] = dataset["reward"][src]
+            self._terminateds[dst] = dataset["terminated"][src]
+            self._truncateds[dst] = dataset["truncated"][src]
 
-        self._num_in_buffer = n
-        self._current_idx = dataset["current_idx"]
+        self._num_in_buffer = keep
+        self._current_idx = keep % self._max_length
         # Note: _n_step_transitions is intentionally not saved/loaded.
         # At most (n_step - 1) in-flight transitions are lost, which is negligible.
         self._n_step_transitions.clear()
